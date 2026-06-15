@@ -15,8 +15,8 @@
 //     CONFIG_DEBUG_INFO_BTF
 //
 // Hooked syscalls:
-//   INBOUND : read, recvfrom
-//   OUTBOUND: write, sendto
+//   INBOUND : read, readv, recvfrom, recvmsg
+//   OUTBOUND: write, writev, sendto, sendmsg
 
 #include <linux/types.h>
 #include <linux/bpf.h>
@@ -30,7 +30,9 @@ char __license[] SEC("license") = "GPL";
 // ============================================================================
 #define MAX_DATA_SIZE   8192
 #define TASK_COMM_LEN   16
-#define PERF_PAGES      4096   // 4096 pages × 4 KB = 16 MB
+// perf_event_mlock_kb default on RHEL 8 / 4.18 is 516 KB.
+// We request 128 pages (512 KB) per CPU to fit within that limit
+// without requiring the user to tweak sysctl.
 
 #define DIR_INBOUND  0
 #define DIR_OUTBOUND 1
@@ -67,7 +69,29 @@ struct sys_exit_ctx {
 // Data structures
 // ============================================================================
 
+// Standard POSIX iovec — used by readv / writev and embedded in msghdr
+struct iovec {
+    void  *iov_base;
+    __u64  iov_len;   // size_t on 64-bit
+};
+
+// Kernel's struct user_msghdr (syscall ABI, stable).
+// Used by recvmsg / sendmsg — we only need msg_iov to reach the buffer.
+struct user_msghdr {
+    unsigned long msg_name;
+    int           msg_namelen;
+    int           __pad1;
+    unsigned long msg_iov;
+    unsigned long msg_iovlen;
+    unsigned long msg_control;
+    unsigned long msg_controllen;
+    int           msg_flags;
+    int           __pad2;
+};
+
 // Per-event payload sent to userspace
+// NOTE: data must be the last field so the kernel-side probe can submit
+// a variable-length event (only the used portion of data[]).
 struct event {
     __u32 pid;
     __u32 tid;
@@ -76,8 +100,8 @@ struct event {
     __u32 data_len;
     __u32 flags;
     __u64 timestamp_ns;
-    __u8  data[MAX_DATA_SIZE];
     char comm[TASK_COMM_LEN];
+    __u8  data[MAX_DATA_SIZE];   // must be last — variable-length
 };
 
 // Per-thread saved syscall arguments (enter -> exit handoff)
@@ -156,6 +180,31 @@ static __always_inline void save_args(__u32 tid, unsigned long buf_ptr,
     bpf_map_update_elem(&active_args, &tid, &a, BPF_ANY);
 }
 
+// Save syscall enter arguments for readv / writev.
+// The buffer is inside the first iovec entry — we must probe_read it here
+// because the pointer is not valid on exit (it lives on the kernel stack).
+static __always_inline void save_args_iov(__u32 tid, void *iov_ptr,
+                                           unsigned long fd,
+                                           __u32 flags) {
+    struct iovec iov;
+    bpf_probe_read(&iov, sizeof(iov), iov_ptr);
+    save_args(tid, (unsigned long)iov.iov_base, fd,
+              (unsigned long)iov.iov_len, flags);
+}
+
+// Save syscall enter arguments for recvmsg / sendmsg.
+// The buffer is two hops away: msghdr → iovec → iov_base.
+static __always_inline void save_args_msg(__u32 tid, void *msg_ptr,
+                                           unsigned long fd,
+                                           __u32 flags) {
+    struct user_msghdr msg;
+    bpf_probe_read(&msg, sizeof(msg), msg_ptr);
+    struct iovec iov;
+    bpf_probe_read(&iov, sizeof(iov), (void *)msg.msg_iov);
+    save_args(tid, (unsigned long)iov.iov_base, fd,
+              (unsigned long)iov.iov_len, flags);
+}
+
 // Read captured data from userspace and push it via perf event output.
 //
 // ctx   — the tracepoint context pointer (required by bpf_perf_event_output)
@@ -172,6 +221,12 @@ static __always_inline void emit_event(void *ctx, __u32 tid, __s64 ret,
         goto cleanup;
 
     __u32 data_len = ret > MAX_DATA_SIZE ? MAX_DATA_SIZE : (__u32)ret;
+
+    // readv / recvmsg may fill only the first iovec partially, but the
+    // syscall return value is the total across all iovecs. Cap at the
+    // single-buffer size we saved so we never read past iov_base.
+    if (data_len > a->count)
+        data_len = (__u32)a->count;
 
     // Use per-CPU scratch buffer — stack is limited to 512 bytes
     __u32 zero = 0;
@@ -195,8 +250,14 @@ static __always_inline void emit_event(void *ctx, __u32 tid, __s64 ret,
     // (bpf_probe_read_user was added in 5.5 and is not used here.)
     bpf_probe_read(&e->data, data_len, (void *)a->buf_ptr);
 
-    // Submit via perf event output
-    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, e, sizeof(*e));
+    // Submit a variable-length event: only the used portion of data[].
+    // With data as the last field, the fixed header is sizeof(*e) -
+    // MAX_DATA_SIZE bytes, and we add data_len on top. This avoids
+    // wasting perf buffer space on unused tail bytes (up to 55× savings
+    // for tiny reads), keeping the buffer pressure well within the
+    // default kernel.perf_event_mlock_kb limit.
+    __u32 event_size = sizeof(*e) - MAX_DATA_SIZE + data_len;
+    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, e, event_size);
 
 cleanup:
     bpf_map_delete_elem(&active_args, &tid);
@@ -238,7 +299,7 @@ int tp_enter_recvfrom(struct sys_enter_ctx *ctx) {
               ctx->args[1],       // buf
               ctx->args[0],       // fd
               ctx->args[2],       // len
-              (__u32)ctx->args[4]); // flags
+              (__u32)ctx->args[3]); // flags
     return 0;
 }
 
@@ -250,7 +311,49 @@ int tp_enter_sendto(struct sys_enter_ctx *ctx) {
               ctx->args[1],       // buf
               ctx->args[0],       // fd
               ctx->args[2],       // len
-              (__u32)ctx->args[4]); // flags
+              (__u32)ctx->args[3]); // flags
+    return 0;
+}
+
+// --- vectored I/O (scatter / gather) ---
+
+SEC("tracepoint/syscalls/sys_enter_readv")
+int tp_enter_readv(struct sys_enter_ctx *ctx) {
+    if (!is_target()) return 0;
+    __u32 tid = bpf_get_current_pid_tgid();
+    // readv(fd, iov, iovcnt) — args[0]=fd, args[1]=iov*, args[2]=iovcnt
+    save_args_iov(tid, (void *)ctx->args[1], ctx->args[0], 0);
+    return 0;
+}
+
+SEC("tracepoint/syscalls/sys_enter_writev")
+int tp_enter_writev(struct sys_enter_ctx *ctx) {
+    if (!is_target()) return 0;
+    __u32 tid = bpf_get_current_pid_tgid();
+    // writev(fd, iov, iovcnt)
+    save_args_iov(tid, (void *)ctx->args[1], ctx->args[0], 0);
+    return 0;
+}
+
+// --- message-based I/O ---
+
+SEC("tracepoint/syscalls/sys_enter_recvmsg")
+int tp_enter_recvmsg(struct sys_enter_ctx *ctx) {
+    if (!is_target()) return 0;
+    __u32 tid = bpf_get_current_pid_tgid();
+    // recvmsg(sockfd, msg, flags) — args[0]=fd, args[1]=msghdr*, args[2]=flags
+    save_args_msg(tid, (void *)ctx->args[1], ctx->args[0],
+                  (__u32)ctx->args[2]);
+    return 0;
+}
+
+SEC("tracepoint/syscalls/sys_enter_sendmsg")
+int tp_enter_sendmsg(struct sys_enter_ctx *ctx) {
+    if (!is_target()) return 0;
+    __u32 tid = bpf_get_current_pid_tgid();
+    // sendmsg(sockfd, msg, flags)
+    save_args_msg(tid, (void *)ctx->args[1], ctx->args[0],
+                  (__u32)ctx->args[2]);
     return 0;
 }
 
@@ -281,6 +384,34 @@ int tp_exit_recvfrom(struct sys_exit_ctx *ctx) {
 
 SEC("tracepoint/syscalls/sys_exit_sendto")
 int tp_exit_sendto(struct sys_exit_ctx *ctx) {
+    if (!is_target()) return 0;
+    emit_event(ctx, bpf_get_current_pid_tgid(), ctx->ret, DIR_OUTBOUND);
+    return 0;
+}
+
+SEC("tracepoint/syscalls/sys_exit_readv")
+int tp_exit_readv(struct sys_exit_ctx *ctx) {
+    if (!is_target()) return 0;
+    emit_event(ctx, bpf_get_current_pid_tgid(), ctx->ret, DIR_INBOUND);
+    return 0;
+}
+
+SEC("tracepoint/syscalls/sys_exit_writev")
+int tp_exit_writev(struct sys_exit_ctx *ctx) {
+    if (!is_target()) return 0;
+    emit_event(ctx, bpf_get_current_pid_tgid(), ctx->ret, DIR_OUTBOUND);
+    return 0;
+}
+
+SEC("tracepoint/syscalls/sys_exit_recvmsg")
+int tp_exit_recvmsg(struct sys_exit_ctx *ctx) {
+    if (!is_target()) return 0;
+    emit_event(ctx, bpf_get_current_pid_tgid(), ctx->ret, DIR_INBOUND);
+    return 0;
+}
+
+SEC("tracepoint/syscalls/sys_exit_sendmsg")
+int tp_exit_sendmsg(struct sys_exit_ctx *ctx) {
     if (!is_target()) return 0;
     emit_event(ctx, bpf_get_current_pid_tgid(), ctx->ret, DIR_OUTBOUND);
     return 0;
