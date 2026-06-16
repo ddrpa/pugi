@@ -49,21 +49,25 @@ grep -E 'CONFIG_BPF_SYSCALL|CONFIG_BPF_EVENTS' /boot/config-$(uname -r)
 
 ## 构建
 
-以笔者的 Rocky Linux 10 和 Fedora WorkStation 43 为例
+以笔者的 Rocky Linux 10 和 Fedora WorkStation 43 为例，构建步骤如下：
 
 ```bash
+# 为了安装 libbpf-devel，你可能需要启用 CodeReady Builder 仓库，在 RHEL 8 上也可能叫做 PowerTools
+# sudo dnf config-manager --set-enabled crb
+# sudo dnf config-manager --set-enabled powertools
 sudo dnf install -y clang libbpf-devel kernel-headers golang make llvm
 cd pugi
 make
 sudo install -m 755 pugi /usr/local/bin/
 ```
 
-本程序需要以 root 权限运行，但是考虑到某些严肃场景下用户可能没有 root 权限：
+### 在非 Linux 平台上构建
+
+项目提供了用于构建的 Containerfile：
 
 ```bash
-# 赋予最小权限集
-sudo setcap cap_bpf,cap_perfmon=ep /usr/local/bin/pugi
-pugi --pid 1234
+docker build -t pugi-builder .
+docker run --rm pugi-builder cat /src/pugi > pugi && chmod +x pugi
 ```
 
 ## 使用
@@ -120,6 +124,17 @@ pugi --pid 18401 --direction outbound --path-prefix /api
 
 # 管道友好的纯文本输出
 pugi --pid 18401 --no-color | grep '"error"'
+```
+
+### 权限说明
+
+本程序需要以 root 权限运行，但是考虑到某些严肃场景下用户可能不是系统管理员：
+
+```bash
+# 系统管理员赋予最小权限集
+sudo setcap cap_bpf,cap_perfmon=ep /usr/local/bin/pugi
+# 普通用户运行
+pugi --pid 1234
 ```
 
 ## 工作原理

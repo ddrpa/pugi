@@ -1,0 +1,17 @@
+# 版本控制
+.git/
+.gitignore
+
+# 本地构建产物
+pugi
+pugi_bpfel.o
+pugi_bpfeb.o
+
+# IDE / 编辑器
+.vscode/
+.idea/
+*.swp
+
+# 容器文件（自身无需被复制）
+Containerfile
+.dockerignore
